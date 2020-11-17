@@ -618,7 +618,7 @@ impl<'a, E: UserDefinedError> EbpfVm<'a, E> {
                     }
                                     reg[dst] >>= reg[src]
                 },
-                ebpf::NEG64      => reg[dst] = -(reg[dst] as i64) as u64,
+                ebpf::NEG64      => reg[dst] = (reg[dst] as i64).wrapping_neg() as u64,
                 ebpf::MOD64_IMM  => reg[dst] %= insn.imm  as u64,
                 ebpf::MOD64_REG  => {
                     if reg[src] == 0 {
