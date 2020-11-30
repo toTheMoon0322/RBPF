@@ -898,7 +898,7 @@ fn test_relative_call() {
     let mut vm = EbpfVm::<UserError>::new(executable.as_ref(), Config::default()).unwrap();
     vm.register_syscall_ex("log", bpf_syscall_string).unwrap();
 
-    let mem = [1 as u8];
+    let mem = [1_u8];
     vm.execute_program(&mem, &[], &[]).unwrap();
 }
 
