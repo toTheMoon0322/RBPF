@@ -9,7 +9,8 @@ Rust (user-space) virtual machine for eBPF
 
 ## Description
 
-This is a fork of [RBPF](https://github.com/qmonnet/rbpf) by Quentin Monnet.
+This is a fork of [RBPF](https://github.com/qmonnet/rbpf) by Quentin Monnet
+with a focus on [secure execution](misc/security-and-countermeasures.md) in distributed networks.
 
 This crate contains a virtual machine for eBPF program execution. BPF, as in
 _Berkeley Packet Filter_, is an assembly-like language initially developed for
@@ -21,8 +22,10 @@ virtual machine of this crate enables running it in user-space applications;
 it contains an interpreter, an x86_64 JIT-compiler for eBPF programs, as well as
 an assembler, disassembler and verifier.
 
-The crate is supposed to compile and run on Linux, MacOS X, and Windows,
-although the JIT-compiler does not work with Windows at this time.
+## Supported Platforms
+
+The crate is supposed to compile and run on Linux, macOS, and Windows,
+although the JIT-compiler does not run on Windows at this time.
 
 ## Link to the crate
 
