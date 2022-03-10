@@ -1495,7 +1495,12 @@ impl JitCompiler {
             if self.config.enable_stack_frame_gaps {
                 X86Instruction::load(OperandSize::S8, RAX, RCX, X86IndirectAccess::Offset(MemoryRegion::VM_GAP_SHIFT_OFFSET)).emit(self)?; // RCX = region.vm_gap_shift;
                 X86Instruction::mov(OperandSize::S64, R11, RDX).emit(self)?; // RDX = R11;
-                emit_alu(self, OperandSize::S64, 0xd3, 5, RDX, 0, None)?; // RDX = R11 >> region.vm_gap_shift;
+                emit_alu(self, OperandSize::S64, 0xd3, 5, RDX, 0, None)?; // RDX = RDX >> region.vm_gap_shift;
+                X86Instruction::test_immediate(OperandSize::S64, RDX, 1, None).emit(self)?; // (RDX & 1) != 0
+                emit_jcc(self, 0x85, TARGET_PC_MEMORY_ACCESS_VIOLATION + target_offset)?;
+                X86Instruction::mov(OperandSize::S64, R11, RDX).emit(self)?; // RDX = R11;
+                X86Instruction::lea(OperandSize::S64, R11, RDX, Some(X86IndirectAccess::Offset(*len - 1))).emit(self)?; // RDX = R11 + len - 1;
+                emit_alu(self, OperandSize::S64, 0xd3, 5, RDX, 0, None)?; // RDX = (R11 + len - 1) >> region.vm_gap_shift;
                 X86Instruction::test_immediate(OperandSize::S64, RDX, 1, None).emit(self)?; // (RDX & 1) != 0
                 emit_jcc(self, 0x85, TARGET_PC_MEMORY_ACCESS_VIOLATION + target_offset)?;
                 X86Instruction::load_immediate(OperandSize::S64, RDX, -1).emit(self)?; // RDX = -1;
@@ -1505,7 +1510,7 @@ impl JitCompiler {
                 emit_alu(self, OperandSize::S64, 0x21, R11, RCX, 0, None)?; // below_gap = R11 & inverse_gap_mask;
                 emit_alu(self, OperandSize::S64, 0x21, RDX, R11, 0, None)?; // above_gap = R11 & gap_mask;
                 emit_alu(self, OperandSize::S64, 0xc1, 5, R11, 1, None)?; // above_gap >>= 1;
-                emit_alu(self, OperandSize::S64, 0x09, RCX, R11, 0, None)?; // gapped_offset = above_gap | below_gap;
+                emit_alu(self, OperandSize::S64, 0x09, RCX, R11, 0, None)?; // gapped_begin_offset = above_gap | below_gap;
             }
             X86Instruction::lea(OperandSize::S64, R11, RCX, Some(X86IndirectAccess::Offset(*len))).emit(self)?; // RCX = R11 + len;
             X86Instruction::cmp(OperandSize::S64, RCX, RAX, Some(X86IndirectAccess::Offset(MemoryRegion::LEN_OFFSET))).emit(self)?; // region.len < R11 + len
