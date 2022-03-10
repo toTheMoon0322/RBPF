@@ -76,17 +76,20 @@ impl MemoryRegion {
         len: u64,
     ) -> Result<u64, EbpfError<E>> {
         let begin_offset = vm_addr.saturating_sub(self.vm_addr);
-        let is_in_gap = (begin_offset
+        let begin_gap = begin_offset
             .checked_shr(self.vm_gap_shift as u32)
-            .unwrap_or(0)
-            & 1)
-            == 1;
+            .unwrap_or(0);
+        let end_gap = begin_offset
+            .saturating_add(len)
+            .saturating_sub(1)
+            .checked_shr(self.vm_gap_shift as u32)
+            .unwrap_or(0);
         let gap_mask = (-1i64).checked_shl(self.vm_gap_shift as u32).unwrap_or(0) as u64;
-        let gapped_offset =
+        let gapped_begin_offset =
             (begin_offset & gap_mask).checked_shr(1).unwrap_or(0) | (begin_offset & !gap_mask);
-        if let Some(end_offset) = gapped_offset.checked_add(len as u64) {
-            if end_offset <= self.len && !is_in_gap {
-                return Ok(self.host_addr.saturating_add(gapped_offset));
+        if let Some(gapped_end_offset) = gapped_begin_offset.checked_add(len) {
+            if gapped_end_offset <= self.len && (begin_gap & 1) == 0 && begin_gap == end_gap {
+                return Ok(self.host_addr.saturating_add(gapped_begin_offset));
             }
         }
         Err(EbpfError::InvalidVirtualAddress(vm_addr))
