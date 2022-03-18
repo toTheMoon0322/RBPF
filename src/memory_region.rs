@@ -72,6 +72,7 @@ impl MemoryRegion {
     /// Does not perform a lower bounds check, as that is already done by the binary search in MemoryMapping::map()
     pub fn vm_to_host<E: UserDefinedError>(
         &self,
+        config: &Config,
         vm_addr: u64,
         len: u64,
     ) -> Result<u64, EbpfError<E>> {
@@ -88,7 +89,10 @@ impl MemoryRegion {
         let gapped_begin_offset =
             (begin_offset & gap_mask).checked_shr(1).unwrap_or(0) | (begin_offset & !gap_mask);
         if let Some(gapped_end_offset) = gapped_begin_offset.checked_add(len) {
-            if gapped_end_offset <= self.len && (begin_gap & 1) == 0 && begin_gap == end_gap {
+            if gapped_end_offset <= self.len
+                && (begin_gap & 1) == 0
+                && (!config.enable_gapped_memory_bounds_check_at_end || begin_gap == end_gap)
+            {
                 return Ok(self.host_addr.saturating_add(gapped_begin_offset));
             }
         }
@@ -178,7 +182,7 @@ impl<'a> MemoryMapping<'a> {
         if (1..self.regions.len()).contains(&index) {
             let region = &self.regions[index];
             if access_type == AccessType::Load || region.is_writable {
-                if let Ok(host_addr) = region.vm_to_host::<E>(vm_addr, len as u64) {
+                if let Ok(host_addr) = region.vm_to_host::<E>(self.config, vm_addr, len as u64) {
                     return Ok(host_addr);
                 }
             }

@@ -1498,11 +1498,13 @@ impl JitCompiler {
                 emit_alu(self, OperandSize::S64, 0xd3, 5, RDX, 0, None)?; // RDX = RDX >> region.vm_gap_shift;
                 X86Instruction::test_immediate(OperandSize::S64, RDX, 1, None).emit(self)?; // (RDX & 1) != 0
                 emit_jcc(self, 0x85, TARGET_PC_MEMORY_ACCESS_VIOLATION + target_offset)?;
-                X86Instruction::mov(OperandSize::S64, R11, RDX).emit(self)?; // RDX = R11;
-                X86Instruction::lea(OperandSize::S64, R11, RDX, Some(X86IndirectAccess::Offset(*len - 1))).emit(self)?; // RDX = R11 + len - 1;
-                emit_alu(self, OperandSize::S64, 0xd3, 5, RDX, 0, None)?; // RDX = (R11 + len - 1) >> region.vm_gap_shift;
-                X86Instruction::test_immediate(OperandSize::S64, RDX, 1, None).emit(self)?; // (RDX & 1) != 0
-                emit_jcc(self, 0x85, TARGET_PC_MEMORY_ACCESS_VIOLATION + target_offset)?;
+                if self.config.enable_gapped_memory_bounds_check_at_end {
+                    X86Instruction::mov(OperandSize::S64, R11, RDX).emit(self)?; // RDX = R11;
+                    X86Instruction::lea(OperandSize::S64, R11, RDX, Some(X86IndirectAccess::Offset(*len - 1))).emit(self)?; // RDX = R11 + len - 1;
+                    emit_alu(self, OperandSize::S64, 0xd3, 5, RDX, 0, None)?; // RDX = (R11 + len - 1) >> region.vm_gap_shift;
+                    X86Instruction::test_immediate(OperandSize::S64, RDX, 1, None).emit(self)?; // (RDX & 1) != 0
+                    emit_jcc(self, 0x85, TARGET_PC_MEMORY_ACCESS_VIOLATION + target_offset)?;
+                }
                 X86Instruction::load_immediate(OperandSize::S64, RDX, -1).emit(self)?; // RDX = -1;
                 emit_alu(self, OperandSize::S64, 0xd3, 4, RDX, 0, None)?; // gap_mask = -1 << region.vm_gap_shift;
                 X86Instruction::mov(OperandSize::S64, RDX, RCX).emit(self)?; // RCX = RDX;

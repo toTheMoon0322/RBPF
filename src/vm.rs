@@ -215,6 +215,8 @@ pub struct Config {
     pub syscall_bpf_function_hash_collision: bool,
     /// Have the verifier reject "callx r10"
     pub reject_callx_r10: bool,
+    /// Throw InvalidVirtualAddress if a memory access starts in valid stack frame but ends in a gap
+    pub enable_gapped_memory_bounds_check_at_end: bool,
 }
 
 impl Default for Config {
@@ -235,6 +237,7 @@ impl Default for Config {
             disable_deprecated_load_instructions: true,
             syscall_bpf_function_hash_collision: true,
             reject_callx_r10: true,
+            enable_gapped_memory_bounds_check_at_end: true,
         }
     }
 }
