@@ -13,6 +13,7 @@
 //! Virtual machine for eBPF programs.
 
 use crate::{
+    aligned_memory::AlignedMemory,
     ebpf,
     elf::{Executable, SBPFVersion},
     error::EbpfError,
@@ -278,6 +279,10 @@ impl Default for Config {
 impl<C: ContextObject> Executable<TautologyVerifier, C> {
     /// Creates an executable from an ELF file
     pub fn from_elf(elf_bytes: &[u8], loader: Arc<BuiltinProgram<C>>) -> Result<Self, EbpfError> {
+        // The new parser creates references from the input byte slice, so
+        // it must be properly aligned. We assume that HOST_ALIGN is a
+        // multiple of the ELF "natural" alignment. See test_load_unaligned.
+        let elf_bytes = AlignedMemory::from_slice(elf_bytes);
         let executable = Executable::load(elf_bytes, loader)?;
         Ok(executable)
     }
@@ -288,6 +293,7 @@ impl<C: ContextObject> Executable<TautologyVerifier, C> {
         sbpf_version: SBPFVersion,
         function_registry: FunctionRegistry,
     ) -> Result<Self, EbpfError> {
+        let text_bytes = AlignedMemory::from_slice(text_bytes);
         Executable::new_from_text_bytes(text_bytes, loader, sbpf_version, function_registry)
             .map_err(EbpfError::ElfError)
     }

@@ -426,12 +426,11 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
 
     /// Create from raw text section bytes (list of instructions)
     pub fn new_from_text_bytes(
-        text_bytes: &[u8],
+        text_bytes: AlignedMemory<{ HOST_ALIGN }>,
         loader: Arc<BuiltinProgram<C>>,
         sbpf_version: SBPFVersion,
         mut function_registry: FunctionRegistry,
     ) -> Result<Self, ElfError> {
-        let elf_bytes = AlignedMemory::from_slice(text_bytes);
         let config = loader.get_config();
         let enable_symbol_and_section_labels = config.enable_symbol_and_section_labels;
         let entry_pc = if let Some((pc, _name)) = function_registry
@@ -449,11 +448,12 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
             )?;
             0
         };
+        let offset_range = 0..text_bytes.len();
         Ok(Self {
             _verifier: PhantomData,
-            elf_bytes,
+            elf_bytes: text_bytes,
             sbpf_version,
-            ro_section: Section::Borrowed(0, 0..text_bytes.len()),
+            ro_section: Section::Borrowed(0, offset_range.clone()),
             text_section_info: SectionInfo {
                 name: if enable_symbol_and_section_labels {
                     ".text".to_string()
@@ -461,7 +461,7 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                     String::default()
                 },
                 vaddr: ebpf::MM_PROGRAM_START,
-                offset_range: 0..text_bytes.len(),
+                offset_range,
             },
             entry_pc,
             function_registry,
@@ -472,8 +472,10 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
     }
 
     /// Fully loads an ELF, including validation and relocation
-    pub fn load(bytes: &[u8], loader: Arc<BuiltinProgram<C>>) -> Result<Self, ElfError> {
-        let elf_bytes = AlignedMemory::from_slice(bytes);
+    pub fn load(
+        elf_bytes: AlignedMemory<{ HOST_ALIGN }>,
+        loader: Arc<BuiltinProgram<C>>,
+    ) -> Result<Self, ElfError> {
         if loader.get_config().new_elf_parser {
             Self::load_with_parser(NewParser::parse(elf_bytes)?, loader)
         } else {
@@ -920,7 +922,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
 
         // Fixup all program counter relative call instructions
         let config = loader.get_config();
-        let text_bytes = elf.as_slice_mut()
+        let text_bytes = elf
+            .as_slice_mut()
             .get_mut(text_section.file_range().unwrap_or_default())
             .ok_or(ElfError::ValueOutOfBounds)?;
         let instruction_count = text_bytes
@@ -1456,7 +1459,8 @@ mod test {
         let mut elf_bytes = Vec::new();
         file.read_to_end(&mut elf_bytes)
             .expect("failed to read elf file");
-        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader())
+            .expect("validation failed");
     }
 
     #[test]
@@ -1466,7 +1470,8 @@ mod test {
         // elf_bytes.as_ptr() + 1 to make it unaligned and test unaligned
         // parsing.
         elf_bytes.insert(0, 0);
-        ElfExecutable::load(&elf_bytes[1..], loader()).expect("validation failed");
+        ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes[1..]), loader())
+            .expect("validation failed");
     }
 
     #[test]
@@ -1477,7 +1482,8 @@ mod test {
         let mut elf_bytes = Vec::new();
         file.read_to_end(&mut elf_bytes)
             .expect("failed to read elf file");
-        let elf = ElfExecutable::load(&elf_bytes, loader.clone()).expect("validation failed");
+        let elf = ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader.clone())
+            .expect("validation failed");
         let parsed_elf = NewParser::parse(AlignedMemory::from_slice(&elf_bytes)).unwrap();
         let executable: &Executable<TautologyVerifier, TestContextObject> = &elf;
         assert_eq!(0, executable.get_entrypoint_instruction_offset());
@@ -1493,34 +1499,36 @@ mod test {
 
         header.e_entry += 8;
         let elf_bytes = write_header(header.clone());
-        let elf = ElfExecutable::load(&elf_bytes, loader.clone()).expect("validation failed");
+        let elf = ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader.clone())
+            .expect("validation failed");
         let executable: &Executable<TautologyVerifier, TestContextObject> = &elf;
         assert_eq!(1, executable.get_entrypoint_instruction_offset());
 
         header.e_entry = 1;
         let elf_bytes = write_header(header.clone());
         assert!(matches!(
-            ElfExecutable::load(&elf_bytes, loader.clone()),
+            ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader.clone()),
             Err(ElfError::EntrypointOutOfBounds)
         ));
 
         header.e_entry = u64::MAX;
         let elf_bytes = write_header(header.clone());
         assert!(matches!(
-            ElfExecutable::load(&elf_bytes, loader.clone()),
+            ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader.clone()),
             Err(ElfError::EntrypointOutOfBounds)
         ));
 
         header.e_entry = initial_e_entry + ebpf::INSN_SIZE as u64 + 1;
         let elf_bytes = write_header(header.clone());
         assert!(matches!(
-            ElfExecutable::load(&elf_bytes, loader.clone()),
+            ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader.clone()),
             Err(ElfError::InvalidEntrypoint)
         ));
 
         header.e_entry = initial_e_entry;
         let elf_bytes = write_header(header);
-        let elf = ElfExecutable::load(&elf_bytes, loader).expect("validation failed");
+        let elf = ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader)
+            .expect("validation failed");
         let executable: &Executable<TautologyVerifier, TestContextObject> = &elf;
         assert_eq!(0, executable.get_entrypoint_instruction_offset());
     }
@@ -1536,7 +1544,7 @@ mod test {
         println!("random bytes");
         for _ in 0..1_000 {
             let elf_bytes: Vec<u8> = (0..100).map(|_| rng.sample(range)).collect();
-            let _ = ElfExecutable::load(&elf_bytes, loader.clone());
+            let _ = ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader.clone());
         }
 
         // Take a real elf and mangle it
@@ -1555,8 +1563,8 @@ mod test {
             100,
             0..parsed_elf.header().e_ehsize as usize,
             0..255,
-            |bytes: &mut [u8]| {
-                let _ = ElfExecutable::load(bytes, loader.clone());
+            |elf_bytes: &mut [u8]| {
+                let _ = ElfExecutable::load(AlignedMemory::from_slice(elf_bytes), loader.clone());
             },
         );
 
@@ -1568,8 +1576,8 @@ mod test {
             100,
             parsed_elf.header().e_shoff as usize..elf_bytes.len(),
             0..255,
-            |bytes: &mut [u8]| {
-                let _ = ElfExecutable::load(bytes, loader.clone());
+            |elf_bytes: &mut [u8]| {
+                let _ = ElfExecutable::load(AlignedMemory::from_slice(elf_bytes), loader.clone());
             },
         );
 
@@ -1581,8 +1589,8 @@ mod test {
             100,
             0..elf_bytes.len(),
             0..255,
-            |bytes: &mut [u8]| {
-                let _ = ElfExecutable::load(bytes, loader.clone());
+            |elf_bytes: &mut [u8]| {
+                let _ = ElfExecutable::load(AlignedMemory::from_slice(elf_bytes), loader.clone());
             },
         );
     }
@@ -2086,7 +2094,8 @@ mod test {
     fn test_writable_data_section() {
         let elf_bytes =
             std::fs::read("tests/elfs/writable_data_section.so").expect("failed to read elf file");
-        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader())
+            .expect("validation failed");
     }
 
     #[test]
@@ -2094,7 +2103,8 @@ mod test {
     fn test_bss_section() {
         let elf_bytes =
             std::fs::read("tests/elfs/bss_section.so").expect("failed to read elf file");
-        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader())
+            .expect("validation failed");
     }
 
     #[test]
@@ -2102,7 +2112,8 @@ mod test {
     fn test_program_headers_overflow() {
         let elf_bytes = std::fs::read("tests/elfs/program_headers_overflow.so")
             .expect("failed to read elf file");
-        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader())
+            .expect("validation failed");
     }
 
     #[test]
@@ -2111,7 +2122,8 @@ mod test {
         let mut elf_bytes =
             std::fs::read("tests/elfs/relative_call_sbpfv1.so").expect("failed to read elf file");
         LittleEndian::write_i32(&mut elf_bytes[0x1074..0x1078], 11);
-        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader())
+            .expect("validation failed");
     }
 
     #[test]
@@ -2120,6 +2132,7 @@ mod test {
         let mut elf_bytes =
             std::fs::read("tests/elfs/relative_call_sbpfv1.so").expect("failed to read elf file");
         LittleEndian::write_i32(&mut elf_bytes[0x1074..0x1078], -16i32);
-        ElfExecutable::load(&elf_bytes, loader()).expect("validation failed");
+        ElfExecutable::load(AlignedMemory::from_slice(&elf_bytes), loader())
+            .expect("validation failed");
     }
 }
