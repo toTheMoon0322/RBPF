@@ -7,7 +7,7 @@
 // this loader will need to be re-written to use the program headers instead.
 
 use crate::{
-    aligned_memory::{is_memory_aligned, AlignedMemory},
+    aligned_memory::AlignedMemory,
     ebpf::{self, EF_SBPF_V2, HOST_ALIGN, INSN_SIZE},
     elf_parser::{
         consts::{
@@ -473,38 +473,26 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
 
     /// Fully loads an ELF, including validation and relocation
     pub fn load(bytes: &[u8], loader: Arc<BuiltinProgram<C>>) -> Result<Self, ElfError> {
+        let elf_bytes = AlignedMemory::from_slice(bytes);
         if loader.get_config().new_elf_parser {
-            // The new parser creates references from the input byte slice, so
-            // it must be properly aligned. We assume that HOST_ALIGN is a
-            // multiple of the ELF "natural" alignment. See test_load_unaligned.
-            let aligned;
-            let bytes = if is_memory_aligned(bytes.as_ptr() as usize, HOST_ALIGN) {
-                bytes
-            } else {
-                aligned = AlignedMemory::<{ HOST_ALIGN }>::from_slice(bytes);
-                aligned.as_slice()
-            };
-            Self::load_with_parser(&NewParser::parse(bytes)?, bytes, loader)
+            Self::load_with_parser(NewParser::parse(elf_bytes)?, loader)
         } else {
-            Self::load_with_parser(&GoblinParser::parse(bytes)?, bytes, loader)
+            Self::load_with_parser(GoblinParser::parse(elf_bytes)?, loader)
         }
     }
 
-    fn load_with_parser<'a, P: ElfParser<'a>>(
-        elf: &'a P,
-        bytes: &[u8],
+    fn load_with_parser<P: ElfParser>(
+        mut elf: P,
         loader: Arc<BuiltinProgram<C>>,
     ) -> Result<Self, ElfError> {
-        let mut elf_bytes = AlignedMemory::from_slice(bytes);
         let config = loader.get_config();
-        let header = elf.header();
-        let sbpf_version = if header.e_flags == EF_SBPF_V2 {
+        let sbpf_version = if elf.header().e_flags == EF_SBPF_V2 {
             SBPFVersion::V2
         } else {
             SBPFVersion::V1
         };
 
-        Self::validate(config, elf, elf_bytes.as_slice())?;
+        Self::validate(config, &elf)?;
 
         // calculate the text section info
         let text_section = elf.section(b".text")?;
@@ -545,15 +533,10 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
 
         // relocate symbols
         let mut function_registry = FunctionRegistry::default();
-        Self::relocate(
-            &mut function_registry,
-            &loader,
-            elf,
-            elf_bytes.as_slice_mut(),
-        )?;
+        Self::relocate(&mut function_registry, &loader, &mut elf)?;
 
         // calculate entrypoint offset into the text section
-        let offset = header.e_entry.saturating_sub(text_section.sh_addr());
+        let offset = elf.header().e_entry.saturating_sub(text_section.sh_addr());
         if offset.checked_rem(ebpf::INSN_SIZE as u64) != Some(0) {
             return Err(ElfError::InvalidEntrypoint);
         }
@@ -578,12 +561,12 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
             &sbpf_version,
             elf.section_headers()
                 .map(|s| (elf.section_name(s.sh_name()), s)),
-            elf_bytes.as_slice(),
+            elf.as_slice(),
         )?;
 
         Ok(Self {
             _verifier: PhantomData,
-            elf_bytes,
+            elf_bytes: elf.deconstruct(),
             sbpf_version,
             ro_section,
             text_section_info,
@@ -633,11 +616,7 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
     // Functions exposed for tests
 
     /// Validates the ELF
-    pub fn validate<'a, P: ElfParser<'a>>(
-        config: &Config,
-        elf: &'a P,
-        elf_bytes: &[u8],
-    ) -> Result<(), ElfError> {
+    pub fn validate<P: ElfParser>(config: &Config, elf: &P) -> Result<(), ElfError> {
         let header = elf.header();
         if header.e_ident.ei_class != ELFCLASS64 {
             return Err(ElfError::WrongClass);
@@ -731,7 +710,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                 .sh_offset()
                 .checked_add(section_header.sh_size())
                 .ok_or(ElfError::ValueOutOfBounds)? as usize;
-            let _ = elf_bytes
+            let _ = elf
+                .as_slice()
                 .get(start..end)
                 .ok_or(ElfError::ValueOutOfBounds)?;
         }
@@ -925,11 +905,10 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
     }
 
     /// Relocates the ELF in-place
-    fn relocate<'a, P: ElfParser<'a>>(
+    fn relocate<P: ElfParser>(
         function_registry: &mut FunctionRegistry,
         loader: &BuiltinProgram<C>,
-        elf: &'a P,
-        elf_bytes: &mut [u8],
+        elf: &mut P,
     ) -> Result<(), ElfError> {
         let mut syscall_cache = BTreeMap::new();
         let text_section = elf.section(b".text")?;
@@ -941,7 +920,7 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
 
         // Fixup all program counter relative call instructions
         let config = loader.get_config();
-        let text_bytes = elf_bytes
+        let text_bytes = elf.as_slice_mut()
             .get_mut(text_section.file_range().unwrap_or_default())
             .ok_or(ElfError::ValueOutOfBounds)?;
         let instruction_count = text_bytes
@@ -982,22 +961,24 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
             }
         }
 
-        let mut program_header: Option<&<P as ElfParser<'a>>::ProgramHeader> = None;
+        let mut program_header: Option<<P as ElfParser>::ProgramHeader> = None;
 
         // Fixup all the relocations in the relocation section if exists
-        for relocation in elf.dynamic_relocations() {
+        for relocation_index in 0..elf.dynamic_relocations_count() {
+            let relocation = elf.dynamic_relocation(relocation_index);
             let mut r_offset = relocation.r_offset() as usize;
 
             // When sbpf_version.enable_elf_vaddr()=true, we allow section.sh_addr !=
             // section.sh_offset so we need to bring r_offset to the correct
             // byte offset.
             if sbpf_version.enable_elf_vaddr() {
-                match program_header {
+                match program_header.as_ref() {
                     Some(header) if header.vm_range().contains(&(r_offset as u64)) => {}
                     _ => {
                         program_header = elf
                             .program_headers()
                             .find(|header| header.vm_range().contains(&(r_offset as u64)))
+                            .cloned()
                     }
                 }
                 let header = program_header.as_ref().ok_or(ElfError::ValueOutOfBounds)?;
@@ -1022,7 +1003,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
 
                     // Read the instruction's immediate field which contains virtual
                     // address to convert to physical
-                    let checked_slice = elf_bytes
+                    let checked_slice = elf
+                        .as_slice()
                         .get(imm_offset..imm_offset.saturating_add(BYTE_LENGTH_IMMEDIATE))
                         .ok_or(ElfError::ValueOutOfBounds)?;
                     let refd_addr = LittleEndian::read_u32(checked_slice) as u64;
@@ -1053,7 +1035,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                         let imm_high_offset = imm_low_offset.saturating_add(INSN_SIZE);
 
                         // Write the low side of the relocate address
-                        let imm_slice = elf_bytes
+                        let imm_slice = elf
+                            .as_slice_mut()
                             .get_mut(
                                 imm_low_offset
                                     ..imm_low_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
@@ -1062,7 +1045,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                         LittleEndian::write_u32(imm_slice, (addr & 0xFFFFFFFF) as u32);
 
                         // Write the high side of the relocate address
-                        let imm_slice = elf_bytes
+                        let imm_slice = elf
+                            .as_slice_mut()
                             .get_mut(
                                 imm_high_offset
                                     ..imm_high_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
@@ -1073,7 +1057,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                             addr.checked_shr(32).unwrap_or_default() as u32,
                         );
                     } else {
-                        let imm_slice = elf_bytes
+                        let imm_slice = elf
+                            .as_slice_mut()
                             .get_mut(imm_offset..imm_offset.saturating_add(8))
                             .ok_or(ElfError::ValueOutOfBounds)?;
                         LittleEndian::write_u64(imm_slice, addr);
@@ -1102,7 +1087,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                             .saturating_add(BYTE_OFFSET_IMMEDIATE);
 
                         // Read the low side of the address
-                        let imm_slice = elf_bytes
+                        let imm_slice = elf
+                            .as_slice()
                             .get(
                                 imm_low_offset
                                     ..imm_low_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
@@ -1111,7 +1097,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                         let va_low = LittleEndian::read_u32(imm_slice) as u64;
 
                         // Read the high side of the address
-                        let imm_slice = elf_bytes
+                        let imm_slice = elf
+                            .as_slice()
                             .get(
                                 imm_high_offset
                                     ..imm_high_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
@@ -1133,7 +1120,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                         }
 
                         // Write back the low half
-                        let imm_slice = elf_bytes
+                        let imm_slice = elf
+                            .as_slice_mut()
                             .get_mut(
                                 imm_low_offset
                                     ..imm_low_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
@@ -1142,7 +1130,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                         LittleEndian::write_u32(imm_slice, (refd_addr & 0xFFFFFFFF) as u32);
 
                         // Write back the high half
-                        let imm_slice = elf_bytes
+                        let imm_slice = elf
+                            .as_slice_mut()
                             .get_mut(
                                 imm_high_offset
                                     ..imm_high_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
@@ -1157,7 +1146,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                             // We're relocating an address inside a data section (eg .rodata). The
                             // address is encoded as a simple u64.
 
-                            let addr_slice = elf_bytes
+                            let addr_slice = elf
+                                .as_slice()
                                 .get(r_offset..r_offset.saturating_add(mem::size_of::<u64>()))
                                 .ok_or(ElfError::ValueOutOfBounds)?;
                             let mut refd_addr = LittleEndian::read_u64(addr_slice);
@@ -1172,14 +1162,16 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                             // relocations we were encoding only the low 32 bits, shifted 32 bits to
                             // the left. Our relocation code used to be compatible with that, so we
                             // need to keep supporting this case for backwards compatibility.
-                            let addr_slice = elf_bytes
+                            let addr_slice = elf
+                                .as_slice()
                                 .get(imm_offset..imm_offset.saturating_add(BYTE_LENGTH_IMMEDIATE))
                                 .ok_or(ElfError::ValueOutOfBounds)?;
                             let refd_addr = LittleEndian::read_u32(addr_slice) as u64;
                             ebpf::MM_PROGRAM_START.saturating_add(refd_addr)
                         };
 
-                        let addr_slice = elf_bytes
+                        let addr_slice = elf
+                            .as_slice_mut()
                             .get_mut(r_offset..r_offset.saturating_add(mem::size_of::<u64>()))
                             .ok_or(ElfError::ValueOutOfBounds)?;
                         LittleEndian::write_u64(addr_slice, refd_addr);
@@ -1237,7 +1229,8 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                         hash
                     };
 
-                    let checked_slice = elf_bytes
+                    let checked_slice = elf
+                        .as_slice_mut()
                         .get_mut(imm_offset..imm_offset.saturating_add(BYTE_LENGTH_IMMEDIATE))
                         .ok_or(ElfError::ValueOutOfBounds)?;
                     LittleEndian::write_u32(checked_slice, key);
@@ -1337,7 +1330,7 @@ mod test {
     #[test]
     fn test_validate() {
         let elf_bytes = std::fs::read("tests/elfs/noop.so").unwrap();
-        let elf = NewParser::parse(&elf_bytes).unwrap();
+        let elf = NewParser::parse(AlignedMemory::from_slice(&elf_bytes)).unwrap();
         let mut header = elf.header().clone();
 
         let config = Config::default();
@@ -1348,68 +1341,113 @@ mod test {
             bytes
         };
 
-        ElfExecutable::validate(&config, &elf, &elf_bytes).expect("validation failed");
+        ElfExecutable::validate(&config, &elf).expect("validation failed");
 
         header.e_ident.ei_class = ELFCLASS32;
         let bytes = write_header(header.clone());
         // the new parser rejects anything other than ELFCLASS64 directly
-        NewParser::parse(&bytes).expect_err("allowed bad class");
-        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect_err("allowed bad class");
+        NewParser::parse(AlignedMemory::from_slice(&bytes)).expect_err("allowed bad class");
+        ElfExecutable::validate(
+            &config,
+            &GoblinParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect_err("allowed bad class");
 
         header.e_ident.ei_class = ELFCLASS64;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect("validation failed");
-        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect("validation failed");
+        ElfExecutable::validate(
+            &config,
+            &NewParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect("validation failed");
+        ElfExecutable::validate(
+            &config,
+            &GoblinParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect("validation failed");
 
         header.e_ident.ei_data = ELFDATA2MSB;
         let bytes = write_header(header.clone());
         // the new parser only supports little endian
-        NewParser::parse(&bytes).expect_err("allowed big endian");
+        NewParser::parse(AlignedMemory::from_slice(&bytes)).expect_err("allowed big endian");
 
         header.e_ident.ei_data = ELFDATA2LSB;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect("validation failed");
-        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect("validation failed");
+        ElfExecutable::validate(
+            &config,
+            &NewParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect("validation failed");
+        ElfExecutable::validate(
+            &config,
+            &GoblinParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect("validation failed");
 
         header.e_ident.ei_osabi = 1;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect_err("allowed wrong abi");
-        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect_err("allowed wrong abi");
+        ElfExecutable::validate(
+            &config,
+            &NewParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect_err("allowed wrong abi");
+        ElfExecutable::validate(
+            &config,
+            &GoblinParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect_err("allowed wrong abi");
 
         header.e_ident.ei_osabi = ELFOSABI_NONE;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect("validation failed");
-        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect("validation failed");
+        ElfExecutable::validate(
+            &config,
+            &NewParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect("validation failed");
+        ElfExecutable::validate(
+            &config,
+            &GoblinParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect("validation failed");
 
         header.e_machine = 42;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect_err("allowed wrong machine");
-        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect_err("allowed wrong machine");
+        ElfExecutable::validate(
+            &config,
+            &NewParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect_err("allowed wrong machine");
+        ElfExecutable::validate(
+            &config,
+            &GoblinParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect_err("allowed wrong machine");
 
         header.e_machine = EM_BPF;
         let bytes = write_header(header.clone());
-        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect("validation failed");
-        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect("validation failed");
+        ElfExecutable::validate(
+            &config,
+            &NewParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect("validation failed");
+        ElfExecutable::validate(
+            &config,
+            &GoblinParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect("validation failed");
 
         header.e_type = ET_REL;
         let bytes = write_header(header);
-        ElfExecutable::validate(&config, &NewParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect_err("allowed wrong type");
-        ElfExecutable::validate(&config, &GoblinParser::parse(&bytes).unwrap(), &elf_bytes)
-            .expect_err("allowed wrong type");
+        ElfExecutable::validate(
+            &config,
+            &NewParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect_err("allowed wrong type");
+        ElfExecutable::validate(
+            &config,
+            &GoblinParser::parse(AlignedMemory::from_slice(&bytes)).unwrap(),
+        )
+        .expect_err("allowed wrong type");
     }
 
     #[test]
@@ -1440,7 +1478,7 @@ mod test {
         file.read_to_end(&mut elf_bytes)
             .expect("failed to read elf file");
         let elf = ElfExecutable::load(&elf_bytes, loader.clone()).expect("validation failed");
-        let parsed_elf = NewParser::parse(&elf_bytes).unwrap();
+        let parsed_elf = NewParser::parse(AlignedMemory::from_slice(&elf_bytes)).unwrap();
         let executable: &Executable<TautologyVerifier, TestContextObject> = &elf;
         assert_eq!(0, executable.get_entrypoint_instruction_offset());
 
@@ -1507,7 +1545,7 @@ mod test {
         let mut elf_bytes = Vec::new();
         file.read_to_end(&mut elf_bytes)
             .expect("failed to read elf file");
-        let parsed_elf = NewParser::parse(&elf_bytes).unwrap();
+        let parsed_elf = NewParser::parse(AlignedMemory::from_slice(&elf_bytes)).unwrap();
 
         // focus on elf header, small typically 64 bytes
         println!("mangle elf header");

@@ -12,6 +12,8 @@ use goblin::{
 };
 
 use crate::{
+    aligned_memory::AlignedMemory,
+    ebpf::HOST_ALIGN,
     elf::ElfError,
     elf_parser::{
         consts::{SHF_ALLOC, SHF_WRITE, SHT_NOBITS, STT_FUNC},
@@ -33,38 +35,55 @@ use crate::{
 /// used to represent ELF data. Some return values are `Cow<T>` since goblin
 /// returns some data by value, while the new parser always borrows from the
 /// underlying file slice.
-pub trait ElfParser<'a>: Sized {
+pub trait ElfParser: Sized {
     /// Program header type.
-    type ProgramHeader: ElfProgramHeader + 'a;
+    type ProgramHeader: ElfProgramHeader;
     /// Iterator of program headers.
-    type ProgramHeaders: Iterator<Item = &'a Self::ProgramHeader>;
+    type ProgramHeaders<'a>: Iterator<Item = &'a Self::ProgramHeader>
+    where
+        Self: 'a;
 
     /// Section header type.
-    type SectionHeader: ElfSectionHeader + 'a;
+    type SectionHeader: ElfSectionHeader;
     /// Iterator of section headers
-    type SectionHeaders: Iterator<Item = &'a Self::SectionHeader>;
+    type SectionHeaders<'a>: Iterator<Item = &'a Self::SectionHeader>
+    where
+        Self: 'a;
 
     /// Symbol type.
-    type Symbol: ElfSymbol + 'a;
+    type Symbol: ElfSymbol;
     /// Iterator of symbols.
-    type Symbols: Iterator<Item = Cow<'a, Self::Symbol>>;
+    type Symbols<'a>: Iterator<Item = Cow<'a, Self::Symbol>>
+    where
+        Self: 'a;
 
     /// Relocation type.
-    type Relocation: ElfRelocation + 'a;
+    type Relocation: ElfRelocation;
     /// Iterator of relocations.
-    type Relocations: Iterator<Item = Cow<'a, Self::Relocation>>;
+    type Relocations<'a>: Iterator<Item = Cow<'a, Self::Relocation>>
+    where
+        Self: 'a;
 
     /// Parses the ELF data included in the buffer.
-    fn parse(data: &'a [u8]) -> Result<Self, ElfError>;
+    fn parse(data: AlignedMemory<{ HOST_ALIGN }>) -> Result<Self, ElfError>;
+
+    /// Get the data slice
+    fn as_slice(&self) -> &[u8];
+
+    /// Get the data mutable slice
+    fn as_slice_mut(&mut self) -> &mut [u8];
+
+    /// Get the modified data slice back out of the parser
+    fn deconstruct(self) -> AlignedMemory<{ HOST_ALIGN }>;
 
     /// Returns the file header.
     fn header(&self) -> &Elf64Ehdr;
 
     /// Returns the program headers.
-    fn program_headers(&'a self) -> Self::ProgramHeaders;
+    fn program_headers(&self) -> Self::ProgramHeaders<'_>;
 
     /// Returns the section headers.
-    fn section_headers(&'a self) -> Self::SectionHeaders;
+    fn section_headers(&self) -> Self::SectionHeaders<'_>;
 
     /// Returns the section with the given `name`.
     fn section(&self, name: &[u8]) -> Result<Self::SectionHeader, ElfError>;
@@ -73,7 +92,7 @@ pub trait ElfParser<'a>: Sized {
     fn section_name(&self, sh_name: Elf64Word) -> Option<&[u8]>;
 
     /// Returns the symbols included in the symbol table.
-    fn symbols(&'a self) -> Self::Symbols;
+    fn symbols(&self) -> Self::Symbols<'_>;
 
     /// Returns the symbol name at the given `st_name` offset.
     fn symbol_name(&self, st_name: Elf64Word) -> Option<&[u8]>;
@@ -85,11 +104,17 @@ pub trait ElfParser<'a>: Sized {
     fn dynamic_symbol_name(&self, st_name: Elf64Word) -> Option<&[u8]>;
 
     /// Returns the dynamic relocations.
-    fn dynamic_relocations(&'a self) -> Self::Relocations;
+    fn dynamic_relocations(&self) -> Self::Relocations<'_>;
+
+    /// Returns the number of dynamic relocations.
+    fn dynamic_relocations_count(&self) -> usize;
+
+    /// Returns the dynamic relocation at the given `index`.
+    fn dynamic_relocation(&self, index: usize) -> Self::Relocation;
 }
 
 /// ELF program header.
-pub trait ElfProgramHeader {
+pub trait ElfProgramHeader: Clone {
     /// Returns the segment virtual address.
     fn p_vaddr(&self) -> Elf64Addr;
 
@@ -107,7 +132,7 @@ pub trait ElfProgramHeader {
 }
 
 /// ELF section header.
-pub trait ElfSectionHeader {
+pub trait ElfSectionHeader: Clone {
     /// Returns the section name offset.
     fn sh_name(&self) -> Elf64Word;
 
@@ -176,42 +201,56 @@ pub trait ElfRelocation: Clone {
 }
 
 /// The Goblin based ELF parser.
-pub struct GoblinParser<'a> {
-    elf: Elf<'a>,
+pub struct GoblinParser {
+    data: AlignedMemory<{ HOST_ALIGN }>,
     header: Elf64Ehdr,
+    elf: Elf<'static>,
 }
 
-impl<'a> ElfParser<'a> for GoblinParser<'a> {
+impl ElfParser for GoblinParser {
     type ProgramHeader = ProgramHeader;
-    type ProgramHeaders = slice::Iter<'a, ProgramHeader>;
+    type ProgramHeaders<'a> = slice::Iter<'a, ProgramHeader>;
 
     type SectionHeader = SectionHeader;
-    type SectionHeaders = slice::Iter<'a, SectionHeader>;
+    type SectionHeaders<'a> = slice::Iter<'a, SectionHeader>;
 
     type Symbol = Sym;
-    type Symbols = iter::Map<SymIterator<'a>, fn(Self::Symbol) -> Cow<'a, Self::Symbol>>;
+    type Symbols<'a> = iter::Map<SymIterator<'a>, fn(Self::Symbol) -> Cow<'a, Self::Symbol>>;
 
     type Relocation = Reloc;
-    type Relocations =
+    type Relocations<'a> =
         iter::Map<RelocIterator<'a>, fn(Self::Relocation) -> Cow<'a, Self::Relocation>>;
 
-    fn parse(data: &'a [u8]) -> Result<GoblinParser<'a>, ElfError> {
-        let elf = Elf::parse(data)?;
+    fn parse(data: AlignedMemory<{ HOST_ALIGN }>) -> Result<GoblinParser, ElfError> {
+        let elf = Elf::parse(unsafe { std::mem::transmute(data.as_slice()) })?;
         Ok(Self {
+            data,
             header: elf.header.into(),
             elf,
         })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+
+    fn as_slice_mut(&mut self) -> &mut [u8] {
+        self.data.as_slice_mut()
+    }
+
+    fn deconstruct(self) -> AlignedMemory<{ HOST_ALIGN }> {
+        self.data
     }
 
     fn header(&self) -> &Elf64Ehdr {
         &self.header
     }
 
-    fn program_headers(&'a self) -> Self::ProgramHeaders {
+    fn program_headers(&self) -> Self::ProgramHeaders<'_> {
         self.elf.program_headers.iter()
     }
 
-    fn section_headers(&'a self) -> Self::SectionHeaders {
+    fn section_headers(&self) -> Self::SectionHeaders<'_> {
         self.elf.section_headers.iter()
     }
 
@@ -238,7 +277,7 @@ impl<'a> ElfParser<'a> for GoblinParser<'a> {
             .map(|name| name.as_bytes())
     }
 
-    fn symbols(&'a self) -> Self::Symbols {
+    fn symbols(&self) -> Self::Symbols<'_> {
         self.elf.syms.iter().map(Cow::Owned)
     }
 
@@ -260,8 +299,16 @@ impl<'a> ElfParser<'a> for GoblinParser<'a> {
             .map(|name| name.as_bytes())
     }
 
-    fn dynamic_relocations(&self) -> Self::Relocations {
+    fn dynamic_relocations(&self) -> Self::Relocations<'_> {
         self.elf.dynrels.iter().map(Cow::Owned)
+    }
+
+    fn dynamic_relocations_count(&self) -> usize {
+        self.elf.dynrels.len()
+    }
+
+    fn dynamic_relocation(&self, index: usize) -> Self::Relocation {
+        self.elf.dynrels.get(index).unwrap()
     }
 }
 
@@ -364,42 +411,54 @@ impl ElfRelocation for Reloc {
 
 /// The new ELF parser.
 #[derive(Debug)]
-pub struct NewParser<'a> {
-    elf: Elf64<'a>,
+pub struct NewParser {
+    data: AlignedMemory<{ HOST_ALIGN }>,
+    elf: Elf64<'static>,
 }
 
-impl<'a> ElfParser<'a> for NewParser<'a> {
+impl ElfParser for NewParser {
     type ProgramHeader = Elf64Phdr;
-    type ProgramHeaders = slice::Iter<'a, Self::ProgramHeader>;
+    type ProgramHeaders<'a> = slice::Iter<'a, Self::ProgramHeader>;
 
     type SectionHeader = Elf64Shdr;
-    type SectionHeaders = slice::Iter<'a, Self::SectionHeader>;
+    type SectionHeaders<'a> = slice::Iter<'a, Self::SectionHeader>;
 
     type Symbol = Elf64Sym;
-    type Symbols =
+    type Symbols<'a> =
         iter::Map<slice::Iter<'a, Self::Symbol>, fn(&'a Self::Symbol) -> Cow<'a, Self::Symbol>>;
 
     type Relocation = Elf64Rel;
-    type Relocations = iter::Map<
+    type Relocations<'a> = iter::Map<
         slice::Iter<'a, Self::Relocation>,
         fn(&'a Self::Relocation) -> Cow<'a, Self::Relocation>,
     >;
 
-    fn parse(data: &'a [u8]) -> Result<NewParser<'a>, ElfError> {
-        Ok(Self {
-            elf: Elf64::parse(data)?,
-        })
+    fn parse(data: AlignedMemory<{ HOST_ALIGN }>) -> Result<NewParser, ElfError> {
+        let elf = Elf64::parse(unsafe { std::mem::transmute(data.as_slice()) })?;
+        Ok(Self { data, elf })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.data.as_slice()
+    }
+
+    fn as_slice_mut(&mut self) -> &mut [u8] {
+        self.data.as_slice_mut()
+    }
+
+    fn deconstruct(self) -> AlignedMemory<{ HOST_ALIGN }> {
+        self.data
     }
 
     fn header(&self) -> &Elf64Ehdr {
         self.elf.file_header()
     }
 
-    fn program_headers(&'a self) -> Self::ProgramHeaders {
+    fn program_headers(&self) -> Self::ProgramHeaders<'_> {
         self.elf.program_header_table().iter()
     }
 
-    fn section_headers(&'a self) -> Self::SectionHeaders {
+    fn section_headers(&self) -> Self::SectionHeaders<'_> {
         self.elf.section_header_table().iter()
     }
 
@@ -421,7 +480,7 @@ impl<'a> ElfParser<'a> for NewParser<'a> {
         self.elf.section_name(sh_name).ok()
     }
 
-    fn symbols(&'a self) -> Self::Symbols {
+    fn symbols(&self) -> Self::Symbols<'_> {
         self.elf
             .symbol_table()
             .ok()
@@ -445,12 +504,24 @@ impl<'a> ElfParser<'a> for NewParser<'a> {
         self.elf.dynamic_symbol_name(st_name).ok()
     }
 
-    fn dynamic_relocations(&'a self) -> Self::Relocations {
+    fn dynamic_relocations(&self) -> Self::Relocations<'_> {
         self.elf
             .dynamic_relocations_table()
             .unwrap_or(&[])
             .iter()
             .map(Cow::Borrowed)
+    }
+
+    fn dynamic_relocations_count(&self) -> usize {
+        self.elf.dynamic_relocations_table().unwrap_or(&[]).len()
+    }
+
+    fn dynamic_relocation(&self, index: usize) -> Self::Relocation {
+        self.elf
+            .dynamic_relocations_table()
+            .as_ref()
+            .unwrap_or(&[].as_ref())[index]
+            .clone()
     }
 }
 
