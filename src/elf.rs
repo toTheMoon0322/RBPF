@@ -922,16 +922,18 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
 
         // Fixup all program counter relative call instructions
         let config = loader.get_config();
-        let text_bytes = elf
-            .as_slice_mut()
-            .get_mut(text_section.file_range().unwrap_or_default())
-            .ok_or(ElfError::ValueOutOfBounds)?;
-        let instruction_count = text_bytes
+        let text_section_file_range = text_section.file_range().unwrap_or_default();
+        let instruction_count = text_section_file_range
             .len()
             .checked_div(ebpf::INSN_SIZE)
             .ok_or(ElfError::ValueOutOfBounds)?;
         for i in 0..instruction_count {
-            let insn = ebpf::get_insn(text_bytes, i);
+            let insn = ebpf::get_insn(
+                elf.as_slice()
+                    .get(text_section_file_range.clone())
+                    .ok_or(ElfError::ValueOutOfBounds)?,
+                i,
+            );
             if insn.opc == ebpf::CALL_IMM
                 && insn.imm != -1
                 && !(sbpf_version.static_syscalls() && insn.src == 0)
@@ -956,11 +958,11 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                     target_pc as usize,
                     name.as_bytes(),
                 )?;
-                let offset = i.saturating_mul(ebpf::INSN_SIZE).saturating_add(4);
-                let checked_slice = text_bytes
-                    .get_mut(offset..offset.saturating_add(4))
-                    .ok_or(ElfError::ValueOutOfBounds)?;
-                LittleEndian::write_u32(checked_slice, key);
+                let offset = i
+                    .saturating_mul(ebpf::INSN_SIZE)
+                    .saturating_add(4)
+                    .saturating_add(text_section_file_range.start);
+                elf.write_u32(offset..offset.saturating_add(4), key)?;
             }
         }
 
@@ -1038,33 +1040,18 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                         let imm_high_offset = imm_low_offset.saturating_add(INSN_SIZE);
 
                         // Write the low side of the relocate address
-                        let imm_slice = elf
-                            .as_slice_mut()
-                            .get_mut(
-                                imm_low_offset
-                                    ..imm_low_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
-                            )
-                            .ok_or(ElfError::ValueOutOfBounds)?;
-                        LittleEndian::write_u32(imm_slice, (addr & 0xFFFFFFFF) as u32);
+                        elf.write_u32(
+                            imm_low_offset..imm_low_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
+                            (addr & 0xFFFFFFFF) as u32,
+                        )?;
 
                         // Write the high side of the relocate address
-                        let imm_slice = elf
-                            .as_slice_mut()
-                            .get_mut(
-                                imm_high_offset
-                                    ..imm_high_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
-                            )
-                            .ok_or(ElfError::ValueOutOfBounds)?;
-                        LittleEndian::write_u32(
-                            imm_slice,
+                        elf.write_u32(
+                            imm_high_offset..imm_high_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
                             addr.checked_shr(32).unwrap_or_default() as u32,
-                        );
+                        )?;
                     } else {
-                        let imm_slice = elf
-                            .as_slice_mut()
-                            .get_mut(imm_offset..imm_offset.saturating_add(8))
-                            .ok_or(ElfError::ValueOutOfBounds)?;
-                        LittleEndian::write_u64(imm_slice, addr);
+                        elf.write_u64(imm_offset..imm_offset.saturating_add(8), addr)?;
                     }
                 }
                 Some(BpfRelocationType::R_Bpf_64_Relative) => {
@@ -1123,27 +1110,16 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                         }
 
                         // Write back the low half
-                        let imm_slice = elf
-                            .as_slice_mut()
-                            .get_mut(
-                                imm_low_offset
-                                    ..imm_low_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
-                            )
-                            .ok_or(ElfError::ValueOutOfBounds)?;
-                        LittleEndian::write_u32(imm_slice, (refd_addr & 0xFFFFFFFF) as u32);
+                        elf.write_u32(
+                            imm_low_offset..imm_low_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
+                            (refd_addr & 0xFFFFFFFF) as u32,
+                        )?;
 
                         // Write back the high half
-                        let imm_slice = elf
-                            .as_slice_mut()
-                            .get_mut(
-                                imm_high_offset
-                                    ..imm_high_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
-                            )
-                            .ok_or(ElfError::ValueOutOfBounds)?;
-                        LittleEndian::write_u32(
-                            imm_slice,
+                        elf.write_u32(
+                            imm_high_offset..imm_high_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
                             refd_addr.checked_shr(32).unwrap_or_default() as u32,
-                        );
+                        )?;
                     } else {
                         let refd_addr = if sbpf_version != SBPFVersion::V1 {
                             // We're relocating an address inside a data section (eg .rodata). The
@@ -1173,11 +1149,10 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                             ebpf::MM_PROGRAM_START.saturating_add(refd_addr)
                         };
 
-                        let addr_slice = elf
-                            .as_slice_mut()
-                            .get_mut(r_offset..r_offset.saturating_add(mem::size_of::<u64>()))
-                            .ok_or(ElfError::ValueOutOfBounds)?;
-                        LittleEndian::write_u64(addr_slice, refd_addr);
+                        elf.write_u64(
+                            r_offset..r_offset.saturating_add(mem::size_of::<u64>()),
+                            refd_addr,
+                        )?;
                     }
                 }
                 Some(BpfRelocationType::R_Bpf_64_32) => {
@@ -1232,11 +1207,10 @@ impl<V: Verifier, C: ContextObject> Executable<V, C> {
                         hash
                     };
 
-                    let checked_slice = elf
-                        .as_slice_mut()
-                        .get_mut(imm_offset..imm_offset.saturating_add(BYTE_LENGTH_IMMEDIATE))
-                        .ok_or(ElfError::ValueOutOfBounds)?;
-                    LittleEndian::write_u32(checked_slice, key);
+                    elf.write_u32(
+                        imm_offset..imm_offset.saturating_add(BYTE_LENGTH_IMMEDIATE),
+                        key,
+                    )?;
                 }
                 _ => return Err(ElfError::UnknownRelocation(relocation.r_type())),
             }

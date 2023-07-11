@@ -1,6 +1,7 @@
 //! Internal ELF parser abstraction.
 use std::{borrow::Cow, convert::TryInto, iter, ops::Range, slice};
 
+use byteorder::{ByteOrder, LittleEndian};
 use goblin::{
     elf::{Elf, Header, ProgramHeader, Reloc, SectionHeader, Sym},
     elf64::{
@@ -70,8 +71,11 @@ pub trait ElfParser: Sized {
     /// Get the data slice
     fn as_slice(&self) -> &[u8];
 
-    /// Get the data mutable slice
-    fn as_slice_mut(&mut self) -> &mut [u8];
+    /// Writes a value at the given offset `range`
+    fn write_u32(&mut self, range: std::ops::Range<usize>, value: u32) -> Result<(), ElfError>;
+
+    /// Writes a value at the given offset `range`
+    fn write_u64(&mut self, range: std::ops::Range<usize>, value: u64) -> Result<(), ElfError>;
 
     /// Get the modified data slice back out of the parser
     fn deconstruct(self) -> AlignedMemory<{ HOST_ALIGN }>;
@@ -234,8 +238,24 @@ impl ElfParser for GoblinParser {
         self.data.as_slice()
     }
 
-    fn as_slice_mut(&mut self) -> &mut [u8] {
-        self.data.as_slice_mut()
+    fn write_u32(&mut self, range: std::ops::Range<usize>, value: u32) -> Result<(), ElfError> {
+        let slice = self
+            .data
+            .as_slice_mut()
+            .get_mut(range)
+            .ok_or(ElfError::ValueOutOfBounds)?;
+        LittleEndian::write_u32(slice, value);
+        Ok(())
+    }
+
+    fn write_u64(&mut self, range: std::ops::Range<usize>, value: u64) -> Result<(), ElfError> {
+        let slice = self
+            .data
+            .as_slice_mut()
+            .get_mut(range)
+            .ok_or(ElfError::ValueOutOfBounds)?;
+        LittleEndian::write_u64(slice, value);
+        Ok(())
     }
 
     fn deconstruct(self) -> AlignedMemory<{ HOST_ALIGN }> {
@@ -442,8 +462,24 @@ impl ElfParser for NewParser {
         self.data.as_slice()
     }
 
-    fn as_slice_mut(&mut self) -> &mut [u8] {
-        self.data.as_slice_mut()
+    fn write_u32(&mut self, range: std::ops::Range<usize>, value: u32) -> Result<(), ElfError> {
+        let slice = self
+            .data
+            .as_slice_mut()
+            .get_mut(range)
+            .ok_or(ElfError::ValueOutOfBounds)?;
+        LittleEndian::write_u32(slice, value);
+        Ok(())
+    }
+
+    fn write_u64(&mut self, range: std::ops::Range<usize>, value: u64) -> Result<(), ElfError> {
+        let slice = self
+            .data
+            .as_slice_mut()
+            .get_mut(range)
+            .ok_or(ElfError::ValueOutOfBounds)?;
+        LittleEndian::write_u64(slice, value);
+        Ok(())
     }
 
     fn deconstruct(self) -> AlignedMemory<{ HOST_ALIGN }> {
